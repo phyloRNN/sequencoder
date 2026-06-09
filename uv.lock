@@ -442,6 +442,18 @@ wheels = [
 ]
 
 [[package]]
+name = "dendropy"
+version = "5.0.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "setuptools" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/76/e4/ea83865a284c81e58d55936578dbfaa012afd7a791a75e1105c46e928f1d/DendroPy-5.0.8.tar.gz", hash = "sha256:1aa901399dc588d56f155930992dd03549f5d8e617ae09a65686bbda98b6ace3", size = 398493, upload-time = "2025-06-04T01:44:28.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/29/3d/d93dfd44e8615b39fab0b939bc7d8030021c092bffb3cc3c50580e75fc8f/DendroPy-5.0.8-py3-none-any.whl", hash = "sha256:6fa3fe71c67cf71d262cf33f12395735de9cd439852d0bd2d229c19df89a2992", size = 465072, upload-time = "2025-06-04T01:44:27.069Z" },
+]
+
+[[package]]
 name = "filelock"
 version = "3.19.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2639,6 +2651,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "black", version = "25.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "black", version = "26.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "dendropy" },
     { name = "matplotlib", version = "3.9.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "matplotlib", version = "3.10.8", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -2663,6 +2676,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "black", specifier = ">=25.11.0" },
+    { name = "dendropy", specifier = ">=5.0.8" },
     { name = "matplotlib", specifier = ">=3.9.4" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "pandas", specifier = ">=2.3.3" },
