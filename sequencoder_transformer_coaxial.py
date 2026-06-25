@@ -127,13 +127,13 @@ class AxialAttentionBlock(nn.Module):
 
 class AxialMSATransformer(nn.Module):
     def __init__(
-            self,
-            in_channels=4,
-            embed_dim=64,
-            latent_dim=128,
-            nhead=4,
-            num_layers=3,
-            max_sites=10000,
+        self,
+        in_channels=4,
+        embed_dim=64,
+        latent_dim=128,
+        nhead=4,
+        num_layers=3,
+        max_sites=10000,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -284,7 +284,7 @@ class SeqBinaryFileDataset(Dataset):
         # Trim sites if too long
         if data_np.shape[2] > MAX_SITES:
             start = np.random.randint(0, data_np.shape[-1] - MAX_SITES)
-            data_np = data_np[:, :, start: start + MAX_SITES]
+            data_np = data_np[:, :, start : start + MAX_SITES]
 
         # --- ADD THIS: Trim/Sub-sample taxa if there are too many sequences ---
         if data_np.shape[1] > MAX_TAXA:
@@ -416,7 +416,7 @@ if __name__ == "__main__":
 
                 # --- MODIFIED: Only step when steps are reached ---
                 if batch_n % GRADIENT_ACCUMULATION_STEPS == 0 or batch_n == len(
-                        train_loader
+                    train_loader
                 ):
                     optimizer.step()
                     optimizer.zero_grad()
