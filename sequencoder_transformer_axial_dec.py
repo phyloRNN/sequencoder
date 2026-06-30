@@ -210,7 +210,7 @@ class AxialMSATransformer(nn.Module):
 
         # 2. Perform Masked Site Modeling Column Operations
         masked_x = x.clone()
-        if self.training and mask_ratio > 0:
+        if mask_ratio > 0:
             rand_mask = torch.rand(B, S, device=device) < mask_ratio
             non_padded_columns = ~col_mask  # [B, S]
             final_mask = rand_mask & non_padded_columns  # [B, S]
@@ -337,14 +337,14 @@ if __name__ == "__main__":
 
         model.to(device)
 
-        INITIAL_LR = 1e-4 if FINETUNE else 1e-3
+        INITIAL_LR = 1e-4 if FINETUNE else 2e-4
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=INITIAL_LR, weight_decay=1e-4
         )
 
         criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
-        patience = 5
+        patience = 15
         counter = 0
         best_val_loss = 0.5444 if FINETUNE else float("inf")
 
@@ -480,6 +480,7 @@ if __name__ == "__main__":
             avg_train_decorr = running_train_decorr_loss / len(train_loader)
             avg_val_recon = running_val_recon_loss / len(val_loader)
             avg_val_decorr = running_val_decorr_loss / len(val_loader)
+            avg_val_total = avg_val_recon + (avg_val_decorr * lambda_decorr)
 
             print(
                 f"\n--- Epoch {epoch + 1} Complete ---"
@@ -503,8 +504,8 @@ if __name__ == "__main__":
             df_history.to_csv(history_csv_path, index=False)
 
             # Early Stopping metric checkpointing guided by reconstruction target
-            if avg_val_recon < best_val_loss:
-                best_val_loss = avg_val_recon
+            if avg_val_total < best_val_loss:
+                best_val_loss = avg_val_total
                 counter = 0
                 torch.save(model.state_dict(), "best_model.pth")
                 print("★ Performance improved! Saving checkpoint.", flush=True)
