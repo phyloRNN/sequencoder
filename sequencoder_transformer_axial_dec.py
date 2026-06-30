@@ -9,14 +9,13 @@ import torch.backends.cuda
 
 from utils import parse_alignment_file_gaps3D as parse_file
 
-# from utils import print_update
 import numpy as np
 import pandas as pd
 import umap
 import matplotlib.pyplot as plt
 from torch.utils.data import random_split
 from pathlib import Path
-import time, tifffile, sys
+import time, sys
 
 EPOCHS = 300
 N_ALI_FILES = 10000
@@ -29,19 +28,17 @@ try:
     RESULT_DIR = os.path.join(W_DIR, "results")
     os.makedirs(RESULT_DIR, exist_ok=True)
     MODEL_PATH = os.path.join(RESULT_DIR, "axial_msa_transformer.pth")
-
-
 except:
     W_DIR = None
 
 DROP_GAPS = False
-CHANNEL_DICT = ["A", "C", "G", "T"]  # , "-"
+CHANNEL_DICT = ["A", "C", "G", "T"]
 
 FINETUNE = True
 
 LATENT_DIM = 128
-BATCH_SIZE = 8  # Reduced from 16
-GRADIENT_ACCUMULATION_STEPS = 4  # 4 * 4 = effective batch size of 16
+BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 4
 DEBUG = False
 TRAIN = True
 predict_training_set = True
@@ -127,56 +124,45 @@ class AxialAttentionBlock(nn.Module):
 
 class AxialMSATransformer(nn.Module):
     def __init__(
-        self,
-        in_channels=4,
-        embed_dim=64,
-        latent_dim=128,
-        nhead=4,
-        num_layers=3,
-        max_sites=10000,
+            self,
+            in_channels=4,
+            embed_dim=64,
+            latent_dim=128,
+            nhead=4,
+            num_layers=3,
+            max_sites=10000,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.latent_dim = latent_dim
 
+        # Encoder Projections
         self.token_embeddings = nn.Conv2d(in_channels, embed_dim, kernel_size=1)
         self.pos_embedding = nn.Embedding(max_sites, embed_dim)
 
         self.encoder_layers = nn.ModuleList(
             [AxialAttentionBlock(embed_dim, nhead) for _ in range(num_layers)]
         )
-
         self.to_latent = nn.Linear(embed_dim * 2, latent_dim)
+
+        # NEW AXIAL DECODER COMPONENTS
         self.from_latent = nn.Linear(latent_dim, embed_dim)
+        self.decoder_token_embeddings = nn.Conv2d(in_channels, embed_dim, kernel_size=1)
 
-        decoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=nhead,
-            dim_feedforward=embed_dim * 4,
-            dropout=0.1,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.decoder_transformer = nn.TransformerEncoder(
-            decoder_layer, num_layers=num_layers
-        )
-
-        self.lineage_projector = nn.Sequential(
-            nn.Linear(in_channels, 16), nn.GELU(), nn.Linear(16, 16)
-        )
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(embed_dim + 16, embed_dim), nn.GELU()
+        self.decoder_layers = nn.ModuleList(
+            [AxialAttentionBlock(embed_dim, nhead) for _ in range(num_layers)]
         )
         self.decoder_head = nn.Conv2d(embed_dim, in_channels, kernel_size=1)
 
-    def encode(self, x):
+    def encode(self, x, row_mask=None, col_mask=None):
         B, C, T, S = x.shape
         device = x.device
 
-        with torch.no_grad():
-            col_mask = x.sum(dim=(1, 2)) == 0  # [B, S]
-            row_mask = x.sum(dim=(1, 3)) == 0  # [B, T]
+        # If masks aren't passed (inference mode), calculate them on the fly
+        if row_mask is None or col_mask is None:
+            with torch.no_grad():
+                col_mask = x.sum(dim=(1, 2)) == 0  # [B, S]
+                row_mask = x.sum(dim=(1, 3)) == 0  # [B, T]
 
         x_emb = self.token_embeddings(x)  # [B, E, T, S]
         x_emb = x_emb.permute(0, 2, 3, 1)  # [B, T, S, E]
@@ -194,80 +180,81 @@ class AxialMSATransformer(nn.Module):
         if col_mask is not None:
             x_emb = x_emb.masked_fill(col_mask.unsqueeze(1).unsqueeze(3), 0.0)
 
-        row_mean = x_emb.sum(dim=1) / (~row_mask).sum(dim=1, keepdim=True).unsqueeze(
-            -1
-        ).clamp(
-            min=1.0
-        )  # [B, S, E]
-        row_max = x_emb.max(dim=1)[0]  # [B, S, E]
+        # Symmetric Taxa Pooling
+        valid_rows = (~row_mask).sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1.0)
+        row_mean = x_emb.sum(dim=1) / valid_rows  # [B, S, E]
+
+        x_for_max = (
+            x_emb.masked_fill(row_mask.unsqueeze(2).unsqueeze(3), -1e9)
+            if row_mask is not None
+            else x_emb
+        )
+        row_max = x_for_max.max(dim=1)[0]  # [B, S, E]
+
         site_features = torch.cat([row_mean, row_max], dim=-1)  # [B, S, E * 2]
 
-        site_mean = site_features.sum(dim=1) / (~col_mask).sum(
-            dim=1, keepdim=True
-        ).clamp(
-            min=1.0
-        )  # [B, E * 2]
+        # Symmetric Site Pooling
+        valid_cols = (~col_mask).sum(dim=1, keepdim=True).clamp(min=1.0)
+        site_mean = site_features.sum(dim=1) / valid_cols  # [B, E * 2]
 
         latent = self.to_latent(site_mean)  # [B, Latent_Dim]
         return latent
 
-    def forward(self, x):
+    def forward(self, x, mask_ratio=0.15):
         B, C, T, S = x.shape
         device = x.device
 
-        latent = self.encode(x)  # [B, Latent_Dim]
-
+        # 1. Compute true padding masks from clean structural data before masking
         with torch.no_grad():
-            valid_sites_mask = (x.sum(dim=1, keepdim=True) > 0).float()
-            site_counts = valid_sites_mask.sum(dim=3, keepdim=True).clamp(min=1.0)
-            col_mask = x.sum(dim=(1, 2)) == 0
+            col_mask = x.sum(dim=(1, 2)) == 0  # [B, S]
+            row_mask = x.sum(dim=(1, 3)) == 0  # [B, T]
 
-        raw_lineage_profiles = (x * valid_sites_mask).sum(dim=3) / site_counts.squeeze(
-            -1
-        )
-        lineage_features = self.lineage_projector(
-            raw_lineage_profiles.transpose(1, 2)
-        )  # [B, T, 16]
+        # 2. Perform Masked Site Modeling Column Operations
+        masked_x = x.clone()
+        if self.training and mask_ratio > 0:
+            rand_mask = torch.rand(B, S, device=device) < mask_ratio
+            non_padded_columns = ~col_mask  # [B, S]
+            final_mask = rand_mask & non_padded_columns  # [B, S]
 
-        recon_sig = self.from_latent(latent).unsqueeze(1).expand(-1, S, -1)  # [B, S, E]
-        positions = torch.arange(0, S, device=device).unsqueeze(0)
-        recon_sites = recon_sig + self.pos_embedding(positions)
+            mask_expanded = final_mask.unsqueeze(1).unsqueeze(2).expand(-1, C, T, -1)
+            masked_x[mask_expanded] = 0.0
+        else:
+            final_mask = torch.zeros((B, S), dtype=torch.bool, device=device)
+            mask_expanded = final_mask.unsqueeze(1).unsqueeze(2).expand(-1, C, T, -1)
 
-        decoded_sites = self.decoder_transformer(
-            recon_sites, src_key_padding_mask=col_mask
-        )
-        decoded_sites = decoded_sites.transpose(1, 2)  # [B, E, S]
+        # 3. Process features through invariant Encoder pipeline
+        latent = self.encode(
+            masked_x, row_mask=row_mask, col_mask=col_mask
+        )  # [B, Latent_Dim]
 
-        expanded_sites = decoded_sites.unsqueeze(2).expand(
-            -1, -1, T, -1
-        )  # [B, E, T, S]
-        expanded_lineage = (
-            lineage_features.transpose(1, 2).unsqueeze(-1).expand(-1, -1, -1, S)
-        )  # [B, 16, T, S]
+        # 4. Process features through equivariant Axial Decoder pipeline
+        recon_sig = self.from_latent(latent)  # [B, E]
+        latent_expanded = (
+            recon_sig.unsqueeze(1).unsqueeze(2).expand(-1, T, S, -1)
+        )  # [B, T, S, E]
 
-        combined = torch.cat([expanded_sites, expanded_lineage], dim=1).permute(
-            0, 2, 3, 1
-        )  # [B, T, S, E + 16]
-        fused = self.fusion_layer(combined).permute(0, 3, 1, 2)  # [B, E, T, S]
+        # Map masked input to provide Identity Anchors per row
+        decoder_features = self.decoder_token_embeddings(masked_x)  # [B, E, T, S]
+        decoder_features = decoder_features.permute(0, 2, 3, 1)  # [B, T, S, E]
 
+        # Horizontal Positional Embeddings
+        positions = (
+            torch.arange(0, S, device=device).unsqueeze(0).unsqueeze(1)
+        )  # [1, 1, S]
+        pos_emb = self.pos_embedding(positions)
+
+        # Combine streams
+        dec_in = decoder_features + latent_expanded + pos_emb
+
+        # Axial Self-Attention Decoder loop
+        for layer in self.decoder_layers:
+            dec_in = layer(dec_in, row_mask=row_mask, col_mask=col_mask)
+
+        # Final Convolution Mapping to channel dimensions
+        fused = dec_in.permute(0, 3, 1, 2)  # [B, E, T, S]
         recon_logits = self.decoder_head(fused)  # [B, C, T, S]
 
-        # FIX: Removed torch.sigmoid() here. Returning raw logits for BCEWithLogitsLoss compatibility.
-        return recon_logits, latent
-
-
-def apply_column_mask(x, mask_ratio=0.15):
-    B, C, T, S = x.shape
-    masked_x = x.clone()
-
-    rand_mask = torch.rand(B, S, device=x.device) < mask_ratio
-    non_padded_columns = x.sum(dim=(1, 2)) > 0  # Shape: [B, S]
-    final_mask = rand_mask & non_padded_columns  # Shape: [B, S]
-
-    mask_expanded = final_mask.unsqueeze(1).unsqueeze(2).expand(-1, C, T, -1)
-    masked_x[mask_expanded] = 0.0
-
-    return masked_x, mask_expanded
+        return recon_logits, latent, mask_expanded
 
 
 class SeqBinaryFileDataset(Dataset):
@@ -281,14 +268,11 @@ class SeqBinaryFileDataset(Dataset):
         file_path = self.file_paths[idx]
         data_np = parse_file(file_path, drop_gaps=DROP_GAPS, channel_dict=CHANNEL_DICT)
 
-        # Trim sites if too long
         if data_np.shape[2] > MAX_SITES:
             start = np.random.randint(0, data_np.shape[-1] - MAX_SITES)
-            data_np = data_np[:, :, start : start + MAX_SITES]
+            data_np = data_np[:, :, start: start + MAX_SITES]
 
-        # --- ADD THIS: Trim/Sub-sample taxa if there are too many sequences ---
         if data_np.shape[1] > MAX_TAXA:
-            # Randomly select subset of sequences to maintain diversity
             indices = np.random.choice(data_np.shape[1], MAX_TAXA, replace=False)
             data_np = data_np[:, indices, :]
 
@@ -322,7 +306,6 @@ def get_channel_densities(file_path, schema="fasta"):
 
 
 if __name__ == "__main__":
-
     if TRAIN:
         files = glob.glob(os.path.join(DATA_DIR, "*"))[:N_ALI_FILES]
         dataset = SeqBinaryFileDataset(files)
@@ -355,15 +338,11 @@ if __name__ == "__main__":
 
         model.to(device)
 
-        # 2. Re-initialize the optimizer with a lower learning rate (Safety Cushion)
-        INITIAL_LR = (
-            1e-4 if FINETUNE else 1e-3
-        )  # Dropped from 1e-3 to 1e-4 for resuming
+        INITIAL_LR = 1e-4 if FINETUNE else 1e-3
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=INITIAL_LR, weight_decay=1e-4
         )
 
-        # FIX: Swapped BCELoss to BCEWithLogitsLoss to bypass unsafe autocast constraints safely
         criterion = torch.nn.BCEWithLogitsLoss(reduction="none")
 
         patience = 5
@@ -378,14 +357,14 @@ if __name__ == "__main__":
             diag_mask = torch.eye(LATENT_DIM).to(device)
             latent_buffer = []
 
-            optimizer.zero_grad()  # Reset BEFORE the batch loop starts
+            optimizer.zero_grad()
 
             for batch_n, batch in enumerate(train_loader, 1):
                 batch = batch.to(device)
 
-                # Forward pass & loss computation
-                masked_batch, mask_indices = apply_column_mask(batch, mask_ratio=0.15)
-                reconstruction, latent = model(masked_batch)
+                # FORWARD PASS (Masking handled seamlessly inside)
+                reconstruction, latent, mask_indices = model(batch, mask_ratio=0.15)
+
                 raw_recon_loss = criterion(reconstruction, batch)
                 valid_data_mask = batch.sum(dim=1, keepdim=True) > 0
                 final_loss_mask = mask_indices & valid_data_mask
@@ -409,14 +388,11 @@ if __name__ == "__main__":
                     d_loss = off_diagonals.abs().mean()
 
                 total_batch_loss = recon_loss + (d_loss * lambda_decorr)
-
-                # --- MODIFIED: Normalize loss by accumulation steps ---
                 total_batch_loss = total_batch_loss / GRADIENT_ACCUMULATION_STEPS
                 total_batch_loss.backward()
 
-                # --- MODIFIED: Only step when steps are reached ---
                 if batch_n % GRADIENT_ACCUMULATION_STEPS == 0 or batch_n == len(
-                    train_loader
+                        train_loader
                 ):
                     optimizer.step()
                     optimizer.zero_grad()
@@ -455,12 +431,9 @@ if __name__ == "__main__":
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(device)
-                    masked_batch, mask_indices = apply_column_mask(
-                        batch, mask_ratio=0.15
-                    )
 
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        reconstruction, _ = model(masked_batch)
+                        reconstruction, _, mask_indices = model(batch, mask_ratio=0.15)
                         raw_v_loss = criterion(reconstruction, batch)
                         valid_data_mask = batch.sum(dim=1, keepdim=True) > 0
                         final_loss_mask = mask_indices & valid_data_mask
@@ -526,8 +499,6 @@ if __name__ == "__main__":
                 data = torch.from_numpy(data_np).float().unsqueeze(0).to(device)
                 latent = model.encode(data)
                 all_embeddings.append(latent.squeeze().cpu().numpy())
-
-                # print_update(f"Processed: {os.path.basename(f_path)}, {i}")
                 i += 1
 
         matrix = np.array(all_embeddings)
@@ -570,7 +541,6 @@ if __name__ == "__main__":
                 data = torch.from_numpy(data_np).float().unsqueeze(0).to(device)
                 latent = model.encode(data)
                 all_embeddings.append(latent.squeeze().cpu().numpy())
-                # print_update(f"Processed: {os.path.basename(f_path)}, {i}")
                 i += 1
 
         matrix = np.array(all_embeddings)
