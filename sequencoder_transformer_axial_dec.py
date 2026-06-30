@@ -34,7 +34,7 @@ except:
 DROP_GAPS = False
 CHANNEL_DICT = ["A", "C", "G", "T"]
 
-FINETUNE = True
+FINETUNE = False
 
 LATENT_DIM = 128
 BATCH_SIZE = 8
