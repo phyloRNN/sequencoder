@@ -158,7 +158,6 @@ class AxialMSATransformer(nn.Module):
         B, C, T, S = x.shape
         device = x.device
 
-        # If masks aren't passed (inference mode), calculate them on the fly
         if row_mask is None or col_mask is None:
             with torch.no_grad():
                 col_mask = x.sum(dim=(1, 2)) == 0  # [B, S]
@@ -349,9 +348,14 @@ if __name__ == "__main__":
         counter = 0
         best_val_loss = 0.5444 if FINETUNE else float("inf")
 
+        # Track history variables
+        history_data = []
+        history_csv_path = os.path.join(RESULT_DIR, "training_history.csv")
+
         for epoch in range(EPOCHS):
             model.train()
-            running_train_loss = 0.0
+            running_train_recon_loss = 0.0
+            running_train_decorr_loss = 0.0
             lambda_decorr = 0.01
 
             diag_mask = torch.eye(LATENT_DIM).to(device)
@@ -362,7 +366,6 @@ if __name__ == "__main__":
             for batch_n, batch in enumerate(train_loader, 1):
                 batch = batch.to(device)
 
-                # FORWARD PASS (Masking handled seamlessly inside)
                 reconstruction, latent, mask_indices = model(batch, mask_ratio=0.15)
 
                 raw_recon_loss = criterion(reconstruction, batch)
@@ -422,18 +425,23 @@ if __name__ == "__main__":
                     )
                     print(s, flush=True)
 
-                running_train_loss += recon_loss.item()
+                running_train_recon_loss += recon_loss.item()
+                running_train_decorr_loss += d_loss.item()
 
             # --- VALIDATION PHASE ---
             model.eval()
-            running_val_loss = 0.0
+            running_val_recon_loss = 0.0
+            running_val_decorr_loss = 0.0
+            val_latent_buffer = []
 
             with torch.no_grad():
                 for batch in val_loader:
                     batch = batch.to(device)
 
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        reconstruction, _, mask_indices = model(batch, mask_ratio=0.15)
+                        reconstruction, latent, mask_indices = model(
+                            batch, mask_ratio=0.15
+                        )
                         raw_v_loss = criterion(reconstruction, batch)
                         valid_data_mask = batch.sum(dim=1, keepdim=True) > 0
                         final_loss_mask = mask_indices & valid_data_mask
@@ -443,19 +451,60 @@ if __name__ == "__main__":
                         else:
                             v_loss = raw_v_loss.mean()
 
-                    running_val_loss += v_loss.item()
+                        # Evaluate validation batch decorrelation
+                        v_d_loss = torch.tensor(0.0).to(device)
+                        if len(val_latent_buffer) > 0:
+                            past_val_latents = torch.cat(val_latent_buffer, dim=0)
+                            z_combined_val = torch.cat(
+                                [latent, past_val_latents], dim=0
+                            )
 
-            avg_train_loss = running_train_loss / len(train_loader)
-            avg_val_loss = running_val_loss / len(val_loader)
+                            mu_v = z_combined_val.mean(dim=0)
+                            std_v = z_combined_val.std(dim=0) + 1e-8
+                            z_std_v = (z_combined_val - mu_v) / std_v
+
+                            corr_matrix_v = (z_std_v.T @ z_std_v) / (
+                                    z_std_v.size(0) - 1
+                            )
+                            off_diagonals_v = corr_matrix_v * (1 - diag_mask)
+                            v_d_loss = off_diagonals_v.abs().mean()
+
+                    running_val_recon_loss += v_loss.item()
+                    running_val_decorr_loss += v_d_loss.item()
+
+                    val_latent_buffer.append(latent.detach())
+                    if len(val_latent_buffer) > 16:
+                        val_latent_buffer.pop(0)
+
+            avg_train_recon = running_train_recon_loss / len(train_loader)
+            avg_train_decorr = running_train_decorr_loss / len(train_loader)
+            avg_val_recon = running_val_recon_loss / len(val_loader)
+            avg_val_decorr = running_val_decorr_loss / len(val_loader)
 
             print(
                 f"\n--- Epoch {epoch + 1} Complete ---"
-                f"\nTrain MSM-Loss: {avg_train_loss:.4f} | Val MSM-Loss: {avg_val_loss:.4f}",
+                f"\nTrain MSM-Loss: {avg_train_recon:.4f} | Train D-Loss: {avg_train_decorr:.4f}"
+                f"\nVal MSM-Loss:   {avg_val_recon:.4f} | Val D-Loss:   {avg_val_decorr:.4f}",
                 flush=True,
             )
 
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            # Record history snapshot
+            epoch_metrics = {
+                "epoch": epoch + 1,
+                "train_msm_loss": avg_train_recon,
+                "train_d_loss": avg_train_decorr,
+                "val_msm_loss": avg_val_recon,
+                "val_d_loss": avg_val_decorr,
+            }
+            history_data.append(epoch_metrics)
+
+            # Write out file directly to safe path
+            df_history = pd.DataFrame(history_data)
+            df_history.to_csv(history_csv_path, index=False)
+
+            # Early Stopping metric checkpointing guided by reconstruction target
+            if avg_val_recon < best_val_loss:
+                best_val_loss = avg_val_recon
                 counter = 0
                 torch.save(model.state_dict(), "best_model.pth")
                 print("★ Performance improved! Saving checkpoint.", flush=True)
@@ -467,6 +516,53 @@ if __name__ == "__main__":
                 if counter >= patience:
                     print("Early stopping triggered. Terminating loop.", flush=True)
                     break
+
+        # Plot loss paths when metrics loop terminates
+        if len(history_data) > 0:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            ax1.plot(
+                df_history["epoch"],
+                df_history["train_msm_loss"],
+                label="Train MSM Loss",
+                color="royalblue",
+            )
+            ax1.plot(
+                df_history["epoch"],
+                df_history["val_msm_loss"],
+                label="Val MSM Loss",
+                color="darkorange",
+            )
+            ax1.set_title("Masked Site Modeling (MSM) Reconstruction Loss")
+            ax1.set_xlabel("Epoch")
+            ax1.set_ylabel("Loss")
+            ax1.legend()
+            ax1.grid(True, linestyle="--", alpha=0.5)
+
+            ax2.plot(
+                df_history["epoch"],
+                df_history["train_d_loss"],
+                label="Train D-Loss",
+                color="forestgreen",
+            )
+            ax2.plot(
+                df_history["epoch"],
+                df_history["val_d_loss"],
+                label="Val D-Loss",
+                color="crimson",
+            )
+            ax2.set_title("Latent Space Decorrelation (D) Loss")
+            ax2.set_xlabel("Epoch")
+            ax2.set_ylabel("Loss")
+            ax2.legend()
+            ax2.grid(True, linestyle="--", alpha=0.5)
+
+            fig.tight_layout()
+            fig.savefig(os.path.join(RESULT_DIR, "loss_curves.pdf"), dpi=300)
+            plt.close(fig)
+            print(
+                f"Loss curves saved to {os.path.join(RESULT_DIR, 'loss_curves.pdf')}",
+                flush=True,
+            )
 
         model.load_state_dict(torch.load("best_model.pth"))
         torch.save(model.state_dict(), MODEL_PATH)
